@@ -1,0 +1,105 @@
+// chat.src — connection + message handling for machin-chat.
+// A reader goroutine owns the socket (ws_recv_text blocks); the UI thread
+// only sends and drains g_ch via non-blocking select each frame.
+//
+// Protocol (machin-rooms): client sends plain text; server broadcasts
+// {"type":"msg","name":..,"text":..} and {"type":"sys","text":..,"count":N}.
+// Endpoint: ws://127.0.0.1:48500/ws?room=<r>&name=<n>
+// Override server with $MDK_CHAT_SERVER (e.g. ws://host:48500).
+// Live-only for now — no history/persistence yet (bkn events is the
+// natural fit later).
+
+type ChatMsg struct { kind string  name string  text string }
+
+var g_ch = make(chan string)
+var g_status = "idle"      // idle | connecting | online | offline
+var g_msgs = []ChatMsg{}
+var g_needs_connect = 1
+
+func jstr(j, path) {
+    v, e := json_get(j, path)
+    if e != "" { return "" }
+    return parse(v, "")
+}
+
+func chat_server() {
+    s := env("MDK_CHAT_SERVER")
+    if s == "" { return "ws://127.0.0.1:48500" }
+    return s
+}
+
+func chat_url() {
+    room := state_str("room", "general")
+    name := state_str("name", "you")
+    return chat_server() + "/ws?room=" + room + "&name=" + name
+}
+
+func chat_reader() {
+    g_status = "connecting"
+    if !ws_connect(chat_url()) { g_status = "offline"  return }
+    g_status = "online"
+    while true {
+        msg, ok := ws_recv_text()
+        if !ok { break }
+        g_ch <- msg
+    }
+    ws_close()
+    g_status = "offline"
+}
+
+func chat_connect() {
+    g_needs_connect = 0
+    g_msgs = []ChatMsg{}
+    go chat_reader()
+}
+
+func chat_send(text) {
+    t := trim(text)
+    if t == "" || g_status != "online" { return }
+    ws_send_text(t)
+}
+
+func chat_status_label() {
+    if g_status == "online" { return "online" }
+    if g_status == "connecting" { return "connecting…" }
+    if g_status == "offline" { return "offline" }
+    return "idle"
+}
+
+func chat_status_color() {
+    if g_status == "online" { return C_ACCENT }
+    if g_status == "connecting" { return C_MUTED }
+    return C_DANGER
+}
+
+func handle_msg(raw) {
+    ty := jstr(raw, ".type")
+    if ty == "msg" {
+        g_msgs = append(g_msgs, ChatMsg{kind: "msg",
+            name: jstr(raw, ".name"), text: jstr(raw, ".text")})
+    } else if ty == "sys" {
+        g_msgs = append(g_msgs, ChatMsg{kind: "sys",
+            name: "", text: jstr(raw, ".text")})
+    }
+    // cap history — drop oldest beyond 500
+    if len(g_msgs) > 500 {
+        keep := []ChatMsg{}
+        i := len(g_msgs) - 500
+        while i < len(g_msgs) { keep = append(keep, g_msgs[i])  i = i + 1 }
+        g_msgs = keep
+    }
+}
+
+// drain every queued socket message; call once per frame
+func chat_poll() {
+    draining := true
+    while draining {
+        draining = false
+        select {
+        case raw := <-g_ch:
+            handle_msg(raw)
+            draining = true
+        default:
+        }
+    }
+}
