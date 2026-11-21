@@ -11,7 +11,20 @@
 
 type ChatMsg struct { kind string  name string  text string }
 
-var g_ch = make(chan string)
+// Release builds sleep in SDL_WaitEventTimeout(-1) until an SDL event
+// arrives, and socket traffic raises none — so the reader pushes a user
+// event per message to wake the wait; the next frame's chat_poll() then
+// drains the queue. SDL_PushEvent is thread-safe and needs no SDL headers:
+// the symbols are already linked into the host (static SDL3 in release,
+// exported by the -rdynamic dev host for the dlopened .so).
+extern "c" {
+    fn SDL_RegisterEvents(int) int
+    fn SDL_PushEvent(int) int
+}
+
+var g_ch = make(chan string)   // unbounded: sends never block, so the reader can't stall on a full UI queue
+var g_wake_ty = 0
+var g_wake_ev = 0
 var g_status = "idle"      // idle | connecting | online | offline
 var g_msgs = []ChatMsg{}
 var g_needs_connect = 1
@@ -34,6 +47,17 @@ func chat_url() {
     return chat_server() + "/ws?room=" + room + "&name=" + name
 }
 
+func chat_wake() {
+    if g_wake_ev == 0 {
+        g_wake_ty = SDL_RegisterEvents(1)
+        g_wake_ev = alloc(128)   // sizeof(SDL_Event); SDL_copyp's the whole union
+    }
+    if g_wake_ty == 0 { return }
+    poke_i32(g_wake_ev, 0, g_wake_ty)   // common.type (Uint32 @ 0)
+    poke_i64(g_wake_ev, 8, 0)           // common.timestamp (@ 8) — let SDL stamp it
+    SDL_PushEvent(g_wake_ev)
+}
+
 func chat_reader() {
     g_status = "connecting"
     if !ws_connect(chat_url()) { g_status = "offline"  return }
@@ -42,6 +66,7 @@ func chat_reader() {
         msg, ok := ws_recv_text()
         if !ok { break }
         g_ch <- msg
+        chat_wake()
     }
     ws_close()
     g_status = "offline"
