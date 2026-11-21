@@ -39,19 +39,19 @@ func chat_url() {
 
 func chat_reader() {
     g_status = "connecting"
-    wake()
-    if !ws_connect(chat_url()) { g_status = "offline"  wake()  return }
+    animate()
+    if !ws_connect(chat_url()) { g_status = "offline"  animate()  return }
     g_status = "online"
-    wake()
+    animate()
     while true {
         msg, ok := ws_recv_text()
         if !ok { break }
         g_ch <- msg
-        wake()
+        animate()
     }
     ws_close()
     g_status = "offline"
-    wake()
+    animate()
 }
 
 func chat_connect() {
