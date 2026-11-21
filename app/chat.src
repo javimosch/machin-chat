@@ -11,6 +11,9 @@
 
 type ChatMsg struct { kind string  name string  text string }
 
+// MFL channels are unbounded (send never blocks), so the reader can't
+// stall here; what it must do is wake the frame loop — release builds
+// sleep until an SDL event — so chat_poll() runs and drains the queue.
 var g_ch = make(chan string)
 var g_status = "idle"      // idle | connecting | online | offline
 var g_msgs = []ChatMsg{}
@@ -36,15 +39,19 @@ func chat_url() {
 
 func chat_reader() {
     g_status = "connecting"
-    if !ws_connect(chat_url()) { g_status = "offline"  return }
+    animate()
+    if !ws_connect(chat_url()) { g_status = "offline"  animate()  return }
     g_status = "online"
+    animate()
     while true {
         msg, ok := ws_recv_text()
         if !ok { break }
         g_ch <- msg
+        animate()
     }
     ws_close()
     g_status = "offline"
+    animate()
 }
 
 func chat_connect() {
