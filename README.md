@@ -32,10 +32,11 @@ Point at another server with `MDK_CHAT_SERVER=ws://host:48500`.
 ~/ai/machin-desktop/mdk check app/
 ```
 
-`app/ws.src` is vendored from `furet/src/wsclient.src` — the pure-MFL ws://
-client (masked client frames with a zero key, extended-length parsing,
-ping→pong). When a core `ws_*` client lands in machin it can be swapped for
-the builtin.
+`app/wsclient.src` is vendored from `javimosch/machin`'s `framework/wsclient.src`
+— the pure-MFL `wsc_*` ws:// client (masked client frames, extended-length
+parsing, fragment reassembly, ping→pong, Sec-WebSocket-Accept verification).
+machin's `ws_*` builtins are the shorter path but need a toolchain newer than
+the pinned v0.142.0; `wsc_*` compiles on both.
 
 ## License
 
