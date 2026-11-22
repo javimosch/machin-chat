@@ -1,6 +1,8 @@
 // chat.src — connection + message handling for machin-chat.
-// A reader goroutine owns the socket (ws_recv_text blocks); the UI thread
+// A reader goroutine owns the socket (wsc_recv blocks); the UI thread
 // only sends and drains g_ch via non-blocking select each frame.
+// wsclient.src (wsc_*) provides the ws:// client — the hand-rolled ws.src
+// was retired because its ws_close() shadowed the new ws_* builtin.
 //
 // Protocol (machin-rooms): client sends plain text; server broadcasts
 // {"type":"msg","name":..,"text":..} and {"type":"sys","text":..,"count":N}.
@@ -22,6 +24,7 @@ extern "c" {
     fn SDL_PushEvent(int) int
 }
 
+var g_ws = WSClient{fd: -1, buf: []bytes{}}   // owned by the reader goroutine; UI only reads fd for send
 var g_ch = make(chan string)   // unbounded: sends never block, so the reader can't stall on a full UI queue
 var g_wake_ty = 0
 var g_wake_ev = 0
@@ -58,17 +61,38 @@ func chat_wake() {
     SDL_PushEvent(g_wake_ev)
 }
 
+// chat_url() -> (host, port, path): wsc_open takes the parts, not the URL.
+func chat_ws_endpoint() (host, port, path) {
+    rest := chat_url()
+    if has_prefix(rest, "ws://") { rest = substr(rest, 5, len(rest)) }
+    slash := index(rest, "/")
+    hostport := rest
+    path = "/"
+    if slash >= 0 { hostport = substr(rest, 0, slash)  path = substr(rest, slash, len(rest)) }
+    host = hostport
+    port = 80
+    colon := index(hostport, ":")
+    if colon >= 0 {
+        host = substr(hostport, 0, colon)
+        port = parse_int(substr(hostport, colon+1, len(hostport)))
+    }
+}
+
 func chat_reader() {
     g_status = "connecting"
-    if !ws_connect(chat_url()) { g_status = "offline"  return }
+    host, port, path := chat_ws_endpoint()
+    c, ok := wsc_open(host, port, path)
+    if ok == 0 { g_status = "offline"  return }
+    g_ws = c
     g_status = "online"
     while true {
-        msg, ok := ws_recv_text()
-        if !ok { break }
+        msg, mok := wsc_recv(c)
+        if mok == 0 { break }
         g_ch <- msg
         chat_wake()
     }
-    ws_close()
+    wsc_close(c)
+    g_ws = WSClient{fd: -1, buf: []bytes{}}
     g_status = "offline"
 }
 
@@ -81,7 +105,7 @@ func chat_connect() {
 func chat_send(text) {
     t := trim(text)
     if t == "" || g_status != "online" { return }
-    ws_send_text(t)
+    wsc_send(g_ws, t)
 }
 
 func chat_status_label() {
