@@ -43,10 +43,10 @@ jobs:
             libsqlite3-dev \
             libxkbcommon-dev libxss-dev libxtst-dev
 
-      - name: Install machin v0.142.0
+      - name: Install machin v0.146.1
         run: |
           curl -fsSL -o /tmp/machin \
-            "https://github.com/javimosch/machin/releases/download/v0.142.0/machin-v0.142.0-linux-${{ matrix.arch }}"
+            "https://github.com/javimosch/machin/releases/download/v0.146.1/machin-v0.146.1-linux-${{ matrix.arch }}"
           chmod +x /tmp/machin
           sudo mv /tmp/machin /usr/local/bin/machin
 
