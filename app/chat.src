@@ -1,17 +1,20 @@
 // chat.src — connection + message handling for machin-chat.
-// A reader goroutine owns the socket (wsc_recv blocks); the UI thread
-// only sends and drains g_ch via non-blocking select each frame.
-// wsclient.src (wsc_*) provides the ws:// client — the hand-rolled ws.src
-// was retired because its ws_close() shadowed the new ws_* builtin.
+// The socket side is in net.src: it runs in goroutines and reports on g_ch,
+// which the UI thread drains via non-blocking select each frame. wsclient.src
+// (wsc_*) provides the ws:// client.
 //
 // Protocol (machin-rooms): client sends plain text; server broadcasts
 // {"type":"msg","name":..,"text":..} and {"type":"sys","text":..,"count":N}.
-// Endpoint: ws://127.0.0.1:48500/ws?room=<r>&name=<n>
+// Endpoint: ws://127.0.0.1:48500/ws?room=<r>&name=<n> (percent-encoded)
 // Override server with $MDK_CHAT_SERVER (e.g. ws://host:48500).
 // Live-only for now — no history/persistence yet (bkn events is the
 // natural fit later).
 
-type ChatMsg struct { kind string  name string  text string }
+// machin-rooms' limits, in bytes: it cuts longer room and user names, and
+// closes the connection on a longer message
+var MAX_ROOM = 64
+var MAX_NAME = 32
+var MAX_MESSAGE = 131072
 
 // Release builds sleep in SDL_WaitEventTimeout(-1) until an SDL event
 // arrives, and socket traffic raises none — so the reader pushes a user
@@ -24,13 +27,17 @@ extern "c" {
     fn SDL_PushEvent(int) int
 }
 
-var g_ws = WSClient{fd: -1, buf: []bytes{}}   // owned by the reader goroutine; UI only reads fd for send
-var g_ch = make(chan string)   // unbounded: sends never block, so the reader can't stall on a full UI queue
+var g_fd = -1       // the current connection, once open
+var g_gen = 0       // bumped by each connect; events from older ones are ignored
 var g_wake_ty = 0
 var g_wake_ev = 0
-var g_status = "idle"      // idle | connecting | online | offline
-var g_msgs = []ChatMsg{}
+var g_status = 0    // ST_*; an int, as are all globals the frame assigns (see history.src)
 var g_needs_connect = 1
+
+var ST_IDLE = 0
+var ST_CONNECTING = 1
+var ST_ONLINE = 2
+var ST_OFFLINE = 3
 
 func jstr(j, path) {
     v, e := json_get(j, path)
@@ -44,17 +51,36 @@ func chat_server() {
     return s
 }
 
+// clip_utf8 cuts s to at most max bytes without splitting a character
+// (the same cut machin-rooms makes).
+func clip_utf8(s, max) (r) {
+    r = s
+    if len(s) <= max { return }
+    b := bytes(substr(s, 0, max + 1))
+    n := max
+    while n > 0 && (byte_at(b, n) & 192) == 128 { n = n - 1 }
+    r = substr(s, 0, n)
+}
+
+// What a room/name field means: empty means the placeholder it shows. A value
+// the server would cut is cut here too, and written back so the field shows it.
+// The state default must be "", the same as text_field's: the first read of a
+// key sets it.
+func chat_field(k, fallback, max) {
+    v := state_str(k, "")
+    c := clip_utf8(trim(v), max)
+    if c != v { set_str(k, c) }
+    if c == "" { return fallback }
+    return c
+}
+
 func chat_url() {
-    room := state_str("room", "general")
-    name := state_str("name", "you")
-    return chat_server() + "/ws?room=" + room + "&name=" + name
+    room := chat_field("room", "general", MAX_ROOM)
+    name := chat_field("name", "you", MAX_NAME)
+    return chat_server() + "/ws?room=" + url_encode(room) + "&name=" + url_encode(name)
 }
 
 func chat_wake() {
-    if g_wake_ev == 0 {
-        g_wake_ty = SDL_RegisterEvents(1)
-        g_wake_ev = alloc(128)   // sizeof(SDL_Event); SDL_copyp's the whole union
-    }
     if g_wake_ty == 0 { return }
     poke_i32(g_wake_ev, 0, g_wake_ty)   // common.type (Uint32 @ 0)
     poke_i64(g_wake_ev, 8, 0)           // common.timestamp (@ 8) — let SDL stamp it
@@ -78,77 +104,93 @@ func chat_ws_endpoint() (host, port, path) {
     }
 }
 
-func chat_reader() {
-    g_status = "connecting"
-    host, port, path := chat_ws_endpoint()
-    c, ok := wsc_open(host, port, path)
-    if ok == 0 { g_status = "offline"  return }
-    g_ws = c
-    g_status = "online"
-    while true {
-        msg, mok := wsc_recv(c)
-        if mok == 0 { break }
-        g_ch <- msg
-        chat_wake()
-    }
-    wsc_close(c)
-    g_ws = WSClient{fd: -1, buf: []bytes{}}
-    g_status = "offline"
-}
-
+// UI thread only, like everything below: the state store is not thread-safe.
 func chat_connect() {
     g_needs_connect = 0
-    g_msgs = []ChatMsg{}
-    go chat_reader()
+    net_init()
+    // allocated here, once, so that readers only ever reuse it
+    if g_wake_ev == 0 {
+        g_wake_ty = SDL_RegisterEvents(1)
+        g_wake_ev = alloc(128)   // sizeof(SDL_Event); SDL_copyp's the whole union
+    }
+    if g_fd >= 0 {
+        net_drop(g_fd)
+        g_fd = -1
+    }
+    g_gen = g_gen + 1
+    hist_clear()
+    g_status = ST_CONNECTING
+    host, port, path := chat_ws_endpoint()
+    go net_dial(g_gen, host, port, path)
 }
 
+// -> true if the message was sent
 func chat_send(text) {
     t := trim(text)
-    if t == "" || g_status != "online" { return }
-    wsc_send(g_ws, t)
+    if t == "" || g_status != ST_ONLINE { return false }
+    if len(t) > MAX_MESSAGE {
+        hist_add("sys", "", "not sent: " + str(len(t)) + " bytes, the limit is " + str(MAX_MESSAGE))
+        return false
+    }
+    return net_write(g_fd, 1, bytes(t)) == 1
 }
 
 func chat_status_label() {
-    if g_status == "online" { return "online" }
-    if g_status == "connecting" { return "connecting…" }
-    if g_status == "offline" { return "offline" }
+    if g_status == ST_ONLINE { return "online" }
+    if g_status == ST_CONNECTING { return "connecting…" }
+    if g_status == ST_OFFLINE { return "offline" }
     return "idle"
 }
 
 func chat_status_color() {
-    if g_status == "online" { return C_ACCENT }
-    if g_status == "connecting" { return C_MUTED }
+    if g_status == ST_ONLINE { return C_ACCENT }
+    if g_status == ST_CONNECTING { return C_MUTED }
     return C_DANGER
 }
 
 func handle_msg(raw) {
     ty := jstr(raw, ".type")
     if ty == "msg" {
-        g_msgs = append(g_msgs, ChatMsg{kind: "msg",
-            name: jstr(raw, ".name"), text: jstr(raw, ".text")})
+        hist_add("msg", jstr(raw, ".name"), jstr(raw, ".text"))
     } else if ty == "sys" {
-        g_msgs = append(g_msgs, ChatMsg{kind: "sys",
-            name: "", text: jstr(raw, ".text")})
-    }
-    // cap history — drop oldest beyond 500
-    if len(g_msgs) > 500 {
-        keep := []ChatMsg{}
-        i := len(g_msgs) - 500
-        while i < len(g_msgs) { keep = append(keep, g_msgs[i])  i = i + 1 }
-        g_msgs = keep
+        hist_add("sys", "", jstr(raw, ".text"))
     }
 }
 
-// drain every queued socket message; call once per frame
+func chat_event(ev) {
+    current := ev.gen == g_gen
+    if ev.kind == NET_OPEN {
+        if current {
+            g_fd = ev.fd
+            g_status = ST_ONLINE
+        } else {
+            net_drop(ev.fd)   // replaced while still connecting
+        }
+    } else if ev.kind == NET_MSG {
+        if current { handle_msg(ev.data) }
+    } else if ev.kind == NET_CLOSED {
+        if ev.fd >= 0 { close(ev.fd) }
+        if current {
+            g_fd = -1
+            g_status = ST_OFFLINE
+        }
+    }
+}
+
+// drain queued socket events; call once per frame. At most 200 a frame, so a
+// flood can neither stop the window drawing nor grow the frame's arena.
 func chat_poll() {
+    n := 0
     draining := true
-    while draining {
+    while draining && n < 200 {
         draining = false
         select {
-        case raw := <-g_ch:
-            handle_msg(raw)
+        case ev := <-g_ch:
+            chat_event(ev)
+            n = n + 1
             draining = true
         default:
         }
     }
+    if draining { animate() }
 }
