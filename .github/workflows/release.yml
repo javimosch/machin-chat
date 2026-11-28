@@ -83,6 +83,9 @@ jobs:
       - name: Check it starts on 22.04 and 24.04
         run: ci/check-starts.sh "dist/machin-chat-linux-${{ matrix.arch }}"
 
+      - name: Check it shows incoming messages
+        run: ci/check-chat.sh "dist/machin-chat-linux-${{ matrix.arch }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: machin-chat-linux-${{ matrix.arch }}
