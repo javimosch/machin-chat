@@ -56,12 +56,13 @@ func view() {
         sv := scroll_view("msgs")
         fill()
         gap(4.0)
-            if len(g_msgs) == 0 {
+            n := hist_len()
+            if n == 0 {
                 col()
                 fillw()
                 center()
                 pad(40.0)
-                    if g_status == "online" {
+                    if g_status == ST_ONLINE {
                         text("Say hi — messages appear here", 14.0)
                     } else {
                         text("Connect to a room to start chatting", 14.0)
@@ -70,8 +71,8 @@ func view() {
                 end()
             }
             i := 0
-            while i < len(g_msgs) {
-                msg_row(g_msgs[i])
+            while i < n {
+                msg_row(hist_get(i))
                 i = i + 1
             }
         end()
@@ -81,8 +82,7 @@ func view() {
             draft := text_field("msg", "Message…")
             fillw()
             if button("Send") || (focused("msg") && key(K_RETURN)) {
-                if trim(draft) != "" {
-                    chat_send(draft)
+                if chat_send(draft) {      // the draft stays if it wasn't sent
                     set_str("msg", "")
                     set_int("msg:caret", 0)
                 }

@@ -1,0 +1,109 @@
+// net.src — the socket side of machin-chat. No UI calls in here, apart from
+// chat_wake() (defined by the UI) after each event is queued.
+//
+// Goroutines never write globals: everything they learn reaches the UI thread
+// as a NetEv on g_ch. The UI thread owns connection state, and is the only one
+// that closes an fd — after the connection's last event (NET_CLOSED), so an fd
+// can't be reused while a reader still holds it. To drop a connection early,
+// the UI calls net_drop(fd), which makes its reader fail and report closed.
+//
+// Memory: a goroutine's memory is freed only when it returns, and wsclient
+// keeps its receive buffer across calls, so an arena { } around wsc_recv
+// would free the buffer under it. Instead, after about net_budget bytes of
+// allocations a reader hands the socket and the unread bytes to a fresh
+// goroutine and returns.
+
+extern "c" {
+    header "sys/socket.h"
+    header "pthread.h"
+    link "pthread"
+    fn shutdown(i32, i32) i32
+    fn pthread_mutex_init(ptr, ptr) i32
+    fn pthread_mutex_lock(ptr) i32
+    fn pthread_mutex_unlock(ptr) i32
+}
+
+type NetEv struct { gen int  kind int  fd int  data string }
+
+var NET_OPEN = 1
+var NET_MSG = 2
+var NET_CLOSED = 3
+
+var net_budget = 4194304
+
+var g_ch = make(chan NetEv)   // unbounded: sends never block, so a reader can't stall on a full UI queue
+// held while writing to a socket. A pthread mutex: a one-token channel can't be
+// a lock, as a machin goroutine never receives a value it sent itself.
+var g_wlock = 0
+
+// call from the UI thread before the first net_dial
+func net_init() {
+    if g_wlock == 0 {
+        g_wlock = alloc(128)   // room for a pthread_mutex_t
+        x := pthread_mutex_init(g_wlock, 0)
+    }
+}
+
+func net_emit(gen, kind, fd, data) {
+    g_ch <- NetEv{gen: gen, kind: kind, fd: fd, data: data}
+    chat_wake()
+}
+
+// every frame write goes through here: the UI sends messages while the
+// reader sends pongs, and two frames must not interleave
+func net_write(fd, opcode, payload) (ok) {
+    f := wsc_frame(opcode, payload)
+    x := pthread_mutex_lock(g_wlock)
+    n := write_bytes(fd, f)
+    x = pthread_mutex_unlock(g_wlock)
+    ok = 0
+    if n == len(f) { ok = 1 }
+}
+
+func net_drop(fd) {
+    x := shutdown(fd, 2)
+}
+
+func net_dial(gen, host, port, path) {
+    c, ok := wsc_open(host, port, path)
+    if ok == 0 { net_emit(gen, NET_CLOSED, -1, "")  return }
+    net_emit(gen, NET_OPEN, c.fd, "")
+    go net_read(gen, c.fd, c.buf[0])
+}
+
+// wsc_next with the pong sent through net_write. -> (message, kind): kind 0
+// closed or failed, 1 a message, 2 a ping or pong between messages (returned
+// so that it counts against the reader's budget).
+func net_next(c) (msg, kind) {
+    msg = bytes("")
+    kind = 0
+    partial := 0
+    while 1 == 1 {
+        fin, opcode, pl, good := wsc_frame_in(c)
+        if good == 0 { return }
+        if opcode == 8 { return }
+        if opcode == 9 || opcode == 10 {
+            if opcode == 9 && net_write(c.fd, 10, pl) == 0 { return }
+            if partial == 0 { kind = 2  return }
+            continue
+        }
+        if len(msg) + len(pl) > 67108864 { msg = bytes("")  return }
+        msg = bytes_concat(msg, pl)
+        partial = 1
+        if fin != 0 { kind = 1  return }
+    }
+}
+
+func net_read(gen, fd, unread) {
+    c := wsc_attach(fd)
+    c.buf[0] = unread
+    spent := 0
+    while spent < net_budget {
+        msg, kind := net_next(c)
+        if kind == 0 { net_emit(gen, NET_CLOSED, fd, "")  return }
+        if kind == 1 { net_emit(gen, NET_MSG, fd, bytes_str(msg)) }
+        // each socket read allocates 64 KiB, plus copies of the message
+        spent = spent + 131072 + len(msg) * 8
+    }
+    go net_read(gen, fd, c.buf[0])
+}

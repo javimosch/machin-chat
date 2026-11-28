@@ -1,0 +1,38 @@
+// history.src — the messages on screen: a ring of the last HIST_CAP, kept in
+// the host's state store. Not in an MFL global: view() runs inside a per-frame
+// arena, where every assignment to a global slice copies the whole slice into
+// memory that is never freed. The store frees a value when it is overwritten.
+
+var HIST_CAP = 500
+// a message is one clipped line on screen, so only its start is kept
+var HIST_TEXT_MAX = 1024
+
+type ChatMsg struct { kind string  name string  text string }
+
+func hist_len() { return state_int("hist:len", 0) }
+
+func hist_clear() {
+    set_int("hist:len", 0)
+    set_int("hist:next", 0)
+}
+
+func hist_add(kind, name, body) {
+    if len(body) > HIST_TEXT_MAX {
+        body = clip_utf8(body, HIST_TEXT_MAX) + " … (" + str(len(body)) + " bytes)"
+    }
+    slot := state_int("hist:next", 0)
+    k := "hist:" + str(slot)
+    set_str(k + ":kind", kind)
+    set_str(k + ":name", name)
+    set_str(k + ":text", body)
+    set_int("hist:next", (slot + 1) % HIST_CAP)
+    n := hist_len()
+    if n < HIST_CAP { set_int("hist:len", n + 1) }
+}
+
+// i = 0 is the oldest message kept
+func hist_get(i) {
+    slot := (state_int("hist:next", 0) - hist_len() + i + HIST_CAP) % HIST_CAP
+    k := "hist:" + str(slot)
+    return ChatMsg{kind: state_str(k + ":kind", ""), name: state_str(k + ":name", ""), text: state_str(k + ":text", "")}
+}

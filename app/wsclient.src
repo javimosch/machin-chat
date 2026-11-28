@@ -1,5 +1,8 @@
-// Vendored verbatim from javimosch/machin framework/wsclient.src (b6a10b2+) —
+// Vendored verbatim from javimosch/machin framework/wsclient.src at v0.146.1 —
 // refresh by re-copying upstream when it changes.
+// One local change, to keep until upstream has it: in wsc_frame_in the two
+// extended-length branches are exclusive (`else if`), so a valid frame's length
+// can't be parsed twice.
 // wsclient.src — a pure-MFL WebSocket (RFC 6455) CLIENT for cleartext ws:// endpoints.
 // For most programs the ws_open/ws_send/ws_recv/ws_close builtins (+ _bin variants)
 // are the shorter path — same wire protocol, no framework compose; this file remains
@@ -89,13 +92,7 @@ func wsc_frame(opcode, payload) (f) {
         }
     }
     f = bytes_concat(f, mask)
-    hx := ""
-    i := 0
-    while i < n {
-        hx = hx + wsc_hex2(byte_at(payload, i) ^ byte_at(mask, i & 3))
-        i = i + 1
-    }
-    f = bytes_concat(f, from_hex(hx))
+    f = bytes_concat(f, bytes_xor(payload, mask))
 }
 
 // wsc_frame_in reads ONE frame -> (fin, opcode, payload, ok). ok=0 on EOF/error.
@@ -119,8 +116,7 @@ func wsc_frame_in(c) (fin, opcode, payload, ok) {
         if wsc_fill(c, 2) == 0 { return }
         e := wsc_take(c, 2)
         n = (byte_at(e, 0) << 8) | byte_at(e, 1)
-    }
-    if n == 127 {
+    } else if n == 127 {
         if wsc_fill(c, 8) == 0 { return }
         e := wsc_take(c, 8)
         n = 0
@@ -136,13 +132,7 @@ func wsc_frame_in(c) (fin, opcode, payload, ok) {
     if wsc_fill(c, n) == 0 { return }
     raw := wsc_take(c, n)
     if masked != 0 {
-        hx := ""
-        i := 0
-        while i < n {
-            hx = hx + wsc_hex2(byte_at(raw, i) ^ byte_at(mask, i & 3))
-            i = i + 1
-        }
-        payload = from_hex(hx)
+        payload = bytes_xor(raw, mask)
     } else {
         payload = raw
     }
@@ -166,6 +156,7 @@ func wsc_next(c) (msg, ok) {
             continue
         }
         if opcode == 10 { continue }
+        if len(msg) + len(pl) > 67108864 { msg = bytes("")  return }
         msg = bytes_concat(msg, pl)
         if fin != 0 { ok = 1  return }
     }
@@ -173,12 +164,26 @@ func wsc_next(c) (msg, ok) {
 
 // ---- the handshake ----
 
+// wsc_unsafe is 1 if s holds a space, a control byte or DEL.
+func wsc_unsafe(s) (bad) {
+    bad = 0
+    b := bytes(s)
+    i := 0
+    while i < len(b) {
+        v := byte_at(b, i)
+        if v <= 32 || v == 127 { bad = 1  return }
+        i = i + 1
+    }
+}
+
 // wsc_dial does the TCP connect + HTTP Upgrade handshake. hdrblock is pre-joined
 // "Name: Value\r\n" lines ("" for none). The 101 status AND the Sec-WebSocket-Accept
 // proof are both verified, so an endpoint that isn't really a WebSocket server
 // can't fake a successful open. Any failure closes the fd and returns ok=0.
 func wsc_dial(host, port, path, hdrblock) (c, ok) {
     ok = 0
+    // host and path go into the request: no spaces or control bytes
+    if wsc_unsafe(host) == 1 || wsc_unsafe(path) == 1 { c = wsc_attach(-1)  return }
     fd := dial(host, port)
     if fd < 0 { c = wsc_attach(fd)  return }
     c = wsc_attach(fd)
